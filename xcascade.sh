@@ -1,27 +1,30 @@
 #!/usr/bin/env bash
 #
+# xcascade — port-forwarding cascades (DNAT) on nftables.
 # xcascade — каскадные пробросы портов (DNAT) на nftables.
 #
-# Принципы:
-#   * все правила живут в отдельной таблице nft «ip xcascade» — чужой файрвол не трогаем;
-#   * источник правды — /etc/xcascade/rules.conf, nft-конфиг генерируется из него;
-#   * применение атомарное: сначала проверка (nft -c), потом загрузка, потом сохранение;
-#   * перед каждым изменением делается бэкап списка правил;
-#   * автозагрузка через systemd-юнит xcascade.service.
+# Principles / Принципы:
+#   * all rules live in a dedicated nft table «ip xcascade» — other firewall rules are never touched;
+#   * source of truth is /etc/xcascade/rules.conf, the nft ruleset is generated from it;
+#   * atomic apply: validate (nft -c) -> load -> save;
+#   * a backup of the rule list is made before every change;
+#   * autostart via the xcascade.service systemd unit;
+#   * UI language: English / Русский (xcascade lang).
 #
-# Справка: xcascade help
-# Репозиторий: https://github.com/Heawikk/xcascade
+# Help / Справка: xcascade help
+# Repository: https://github.com/Heawikk/xcascade
 #
 set -u
 set -o pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 PROG="xcascade"
 REPO_URL="https://github.com/Heawikk/xcascade"
 
 CONF_DIR="${XCASCADE_CONF_DIR:-/etc/xcascade}"
 RULES_FILE="$CONF_DIR/rules.conf"
 NFT_FILE="$CONF_DIR/xcascade.nft"
+LANG_FILE="$CONF_DIR/lang"
 BACKUP_DIR="$CONF_DIR/backups"
 LOCK_FILE="${XCASCADE_LOCK_FILE:-/run/xcascade.lock}"
 NFT_TABLE="xcascade"
@@ -36,6 +39,30 @@ MAX_BACKUPS=20
 
 INTERACTIVE=0
 DOCTOR_BAD=0
+UI_LANG="en"      # en | ru; по умолчанию английский
+S=""              # результат sel()
+
+# ------------------------------------------------------------ язык / i18n ----
+# sel "ru" "en" — выбирает строку по текущему языку и кладёт её в $S.
+# Если передан один аргумент — он используется для обоих языков.
+sel() {
+    if [[ $UI_LANG == ru ]]; then S=$1; else S=${2-$1}; fi
+}
+
+load_lang() {
+    local l
+    if [[ ${XCASCADE_LANG:-} == ru || ${XCASCADE_LANG:-} == en ]]; then
+        UI_LANG=$XCASCADE_LANG
+        return 0
+    fi
+    if [[ -r $LANG_FILE ]]; then
+        l=$(head -c 8 "$LANG_FILE" 2>/dev/null | tr -d '[:space:]')
+        if [[ $l == ru || $l == en ]]; then UI_LANG=$l; fi
+    fi
+    return 0
+}
+
+lang_is_saved() { [[ -n ${XCASCADE_LANG:-} || -f $LANG_FILE ]]; }
 
 # ---------------------------------------------------------------- вывод ----
 if [[ -t 1 ]]; then
@@ -45,44 +72,51 @@ else
     C_RED=""; C_GRN=""; C_YEL=""; C_CYN=""; C_BLD=""; C_OFF=""
 fi
 
-info() { printf '%s\n' "${C_CYN}[*]${C_OFF} $*"; }
-ok()   { printf '%s\n' "${C_GRN}[OK]${C_OFF} $*"; }
-warn() { printf '%s\n' "${C_YEL}[!]${C_OFF} $*" >&2; }
-err()  { printf '%s\n' "${C_RED}[ОШИБКА]${C_OFF} $*" >&2; }
+say()  { sel "$@"; printf '%s\n' "$S"; }
+info() { sel "$@"; printf '%s\n' "${C_CYN}[*]${C_OFF} $S"; }
+ok()   { sel "$@"; printf '%s\n' "${C_GRN}[OK]${C_OFF} $S"; }
+warn() { sel "$@"; printf '%s\n' "${C_YEL}[!]${C_OFF} $S" >&2; }
+err()  { sel "$@"; local m=$S; sel "ОШИБКА" "ERROR"; printf '%s\n' "${C_RED}[${S}]${C_OFF} $m" >&2; }
 
 # ------------------------------------------------------------ утилиты ------
 have() { command -v "$1" >/dev/null 2>&1; }
 
 need_root() {
     [[ $EUID -eq 0 ]] && return 0
-    err "Нужны права root. Запустите: sudo $PROG ..."
+    err "Нужны права root. Запустите: sudo $PROG ..." "Root privileges required. Run: sudo $PROG ..."
     return 1
 }
 
 need_nft() {
     have nft && return 0
-    err "nftables не установлен. Выполните: sudo $PROG install"
+    err "nftables не установлен. Выполните: sudo $PROG install" "nftables is not installed. Run: sudo $PROG install"
     return 1
 }
 
+# confirm "ru" "en"
 confirm() {
     local a
-    read -r -p "$1 [y/N]: " a || return 1
+    sel "$1" "${2-$1}"
+    read -r -p "$S [y/N]: " a || return 1
     a=${a,,}
-    [[ $a == y || $a == yes ]]
+    [[ $a == y || $a == yes || ( $UI_LANG == ru && ( $a == д || $a == да ) ) ]]
 }
 
-pause() { read -r -p "Enter — назад..." _ || true; }
+pause() {
+    sel "Enter — назад..." "Press Enter to go back..."
+    read -r -p "$S" _ || true
+}
 
 lock() {
     have flock || return 0
     mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null
     if ! exec 9>"$LOCK_FILE"; then
-        err "Не удалось открыть lock-файл $LOCK_FILE"
+        err "Не удалось открыть lock-файл $LOCK_FILE" "Could not open lock file $LOCK_FILE"
         return 1
     fi
     if ! flock -w 10 9; then
-        err "Другой экземпляр $PROG уже изменяет правила. Попробуйте позже."
+        err "Другой экземпляр $PROG уже изменяет правила. Попробуйте позже." \
+            "Another $PROG instance is already changing the rules. Try again later."
         exec 9>&-
         return 1
     fi
@@ -101,6 +135,59 @@ with_lock() {
 
 ensure_dirs() {
     mkdir -p "$CONF_DIR" "$BACKUP_DIR" && chmod 700 "$CONF_DIR"
+}
+
+# ------------------------------------------------------- выбор языка --------
+set_lang() {
+    UI_LANG=$1
+    if ensure_dirs 2>/dev/null && printf '%s\n' "$1" > "$LANG_FILE" 2>/dev/null; then
+        chmod 600 "$LANG_FILE" 2>/dev/null
+    else
+        warn "Не удалось сохранить язык в $LANG_FILE (будет действовать до конца сеанса)." \
+             "Could not save the language to $LANG_FILE (it applies until this session ends)."
+    fi
+}
+
+ask_lang() {
+    local c
+    printf '\n%s\n  1) English\n  2) Русский\n' "Select language / Выберите язык:"
+    while true; do
+        read -r -p "[1/2] (Enter = 1): " c || c=1
+        case ${c:-1} in
+            1|en|EN) set_lang en; return 0 ;;
+            2|ru|RU) set_lang ru; return 0 ;;
+        esac
+    done
+}
+
+# Спрашиваем язык при первом интерактивном запуске (меню или install).
+maybe_ask_lang() {
+    local cmd=$1; shift
+    [[ $cmd == "" || $cmd == install ]] || return 0
+    lang_is_saved && return 0
+    [[ " $* " == *" --lang "* ]] && return 0
+    [[ -t 0 && -t 1 && $EUID -eq 0 ]] || return 0
+    ask_lang
+}
+
+cmd_lang() {
+    local want=${1:-}
+    need_root || return 1
+    if [[ -z $want ]]; then
+        if [[ -t 0 ]]; then
+            ask_lang
+        else
+            say "Текущий язык: $UI_LANG (сменить: $PROG lang ru|en)" "Current language: $UI_LANG (change: $PROG lang ru|en)"
+            return 0
+        fi
+    else
+        case ${want,,} in
+            ru|russian) set_lang ru ;;
+            en|english) set_lang en ;;
+            *) err "Неизвестный язык: $want (допустимо: ru, en)" "Unknown language: $want (use ru or en)"; return 1 ;;
+        esac
+    fi
+    ok "Язык интерфейса: Русский" "Interface language: English"
 }
 
 # --------------------------------------------------------- валидация -------
@@ -161,11 +248,11 @@ validate_target_ip() {
     local ip=$1 a
     a=${ip%%.*}
     if (( a == 0 || a == 127 || a >= 224 )); then
-        err "Недопустимый адрес назначения: $ip"
+        err "Недопустимый адрес назначения: $ip" "Invalid target address: $ip"
         return 1
     fi
     if local_ipv4s | grep -qxF "$ip"; then
-        err "$ip — адрес этого же сервера, проброс зациклится."
+        err "$ip — адрес этого же сервера, проброс зациклится." "$ip is this server's own address, the forwarding would loop."
         return 1
     fi
     return 0
@@ -193,7 +280,8 @@ safety_check() {
     while read -r sp; do
         [[ -n $sp ]] || continue
         if (( sp >= lo && sp <= hi )); then
-            err "Порт $sp занят SSH: проброс отрежет вам доступ к серверу."
+            err "Порт $sp занят SSH: проброс отрежет вам доступ к серверу." \
+                "Port $sp is used by SSH: forwarding it would cut off your access to the server."
             rc=1
         fi
     done < <(ssh_ports)
@@ -203,7 +291,8 @@ safety_check() {
             [[ $q =~ ^[0-9]+$ ]] || continue
             (( q >= lo && q <= hi )) || continue
             [[ $ssh_list == *" $q "* ]] && continue
-            warn "На порту $q/$p уже слушает локальная служба — снаружи она станет недоступна."
+            warn "На порту $q/$p уже слушает локальная служба — снаружи она станет недоступна." \
+                 "A local service is already listening on $q/$p — it would become unreachable from outside."
             (( rc == 0 )) && rc=2
         done < <(listening_ports "$p")
     done
@@ -223,7 +312,8 @@ load_rules() {
         [[ -z ${name:-} || $name == \#* ]] && continue
         if [[ -n ${extra:-} ]] || ! valid_name "$name" || ! valid_proto "${proto:-}" \
             || ! is_portspec "${inp:-}" || ! is_ipv4 "${ip:-}" || ! is_portspec "${out:-}"; then
-            err "Повреждённая строка $ln в $file: $name ${proto:-} ${inp:-} ${ip:-} ${out:-}"
+            err "Повреждённая строка $ln в $file: $name ${proto:-} ${inp:-} ${ip:-} ${out:-}" \
+                "Corrupted line $ln in $file: $name ${proto:-} ${inp:-} ${ip:-} ${out:-}"
             return 1
         fi
         R_NAME+=("$name"); R_PROTO+=("$proto"); R_IN+=("$inp"); R_IP+=("$ip"); R_OUT+=("$out")
@@ -235,7 +325,7 @@ save_rules() {
     local tmp i
     tmp=$(mktemp "$CONF_DIR/.rules.XXXXXX") || return 1
     {
-        echo "# xcascade: имя протокол вход ip выход"
+        echo "# xcascade: name protocol in ip out"
         for ((i = 0; i < ${#R_NAME[@]}; i++)); do
             echo "${R_NAME[i]} ${R_PROTO[i]} ${R_IN[i]} ${R_IP[i]} ${R_OUT[i]}"
         done
@@ -260,7 +350,7 @@ remove_rule_at() {
 gen_nft() {
     local i p dest
     cat <<EOF
-# Сгенерировано $PROG $VERSION. Не редактируйте вручную: правила хранятся в $RULES_FILE
+# Generated by $PROG $VERSION. Do not edit: the rules are stored in $RULES_FILE
 add table ip $NFT_TABLE
 delete table ip $NFT_TABLE
 table ip $NFT_TABLE {
@@ -299,16 +389,19 @@ EOF
 # Проверка + загрузка в ядро + сохранение файла для автозагрузки.
 apply_nft() {
     local tmp out
-    tmp=$(mktemp "$CONF_DIR/.nft.XXXXXX") || { err "Не удалось создать временный файл в $CONF_DIR"; return 1; }
+    tmp=$(mktemp "$CONF_DIR/.nft.XXXXXX") || {
+        err "Не удалось создать временный файл в $CONF_DIR" "Could not create a temporary file in $CONF_DIR"
+        return 1
+    }
     gen_nft > "$tmp"
     if ! out=$(nft -c -f "$tmp" 2>&1); then
-        err "nft отклонил конфигурацию, ничего не изменено:"
+        err "nft отклонил конфигурацию, ничего не изменено:" "nft rejected the configuration, nothing was changed:"
         printf '%s\n' "$out" >&2
         rm -f "$tmp"
         return 1
     fi
     if ! out=$(nft -f "$tmp" 2>&1); then
-        err "Не удалось загрузить правила в ядро:"
+        err "Не удалось загрузить правила в ядро:" "Could not load the rules into the kernel:"
         printf '%s\n' "$out" >&2
         rm -f "$tmp"
         return 1
@@ -327,10 +420,10 @@ make_backup() {
 }
 
 commit() {
-    ensure_dirs || { err "Не удалось создать $CONF_DIR"; return 1; }
+    ensure_dirs || { err "Не удалось создать $CONF_DIR" "Could not create $CONF_DIR"; return 1; }
     make_backup
     apply_nft || return 1
-    save_rules || { err "Не удалось сохранить $RULES_FILE"; return 1; }
+    save_rules || { err "Не удалось сохранить $RULES_FILE" "Could not save $RULES_FILE"; return 1; }
 }
 
 # ------------------------------------------------------------- UFW ---------
@@ -345,7 +438,8 @@ ufw_add_rule() {
     for p in $(protos_of "${R_PROTO[i]}"); do
         if ! ufwc route allow proto "$p" from any to "${R_IP[i]}" port "$spec" \
             comment "${TAG_PREFIX}${R_NAME[i]}" >/dev/null 2>&1; then
-            warn "UFW: не удалось добавить route-правило для ${R_NAME[i]} ($p). Проверьте: $PROG doctor"
+            warn "UFW: не удалось добавить route-правило для ${R_NAME[i]} ($p). Проверьте: $PROG doctor" \
+                 "UFW: could not add a route rule for ${R_NAME[i]} ($p). Check: $PROG doctor"
             return 1
         fi
     done
@@ -381,11 +475,12 @@ server_ip() {
         pub=$(curl -4 -fsS --max-time 3 https://api.ipify.org 2>/dev/null)
         is_ipv4 "${pub:-}" && ip=$pub
     fi
-    echo "${ip:-<IP-этого-сервера>}"
+    echo "${ip:-<server-ip>}"
 }
 
 usage_add() {
-    cat <<EOF
+    if [[ $UI_LANG == ru ]]; then
+        cat <<EOF
 Использование: $PROG add <tcp|udp|both> <порт|диапазон> <ip[:порт]> [имя] [опции]
 
   <порт>    порт на этом сервере; диапазон: 20000-20100
@@ -399,6 +494,22 @@ usage_add() {
   --dry-run   показать конфиг и проверить его через nft -c, ничего не применяя
   --no-ufw    не добавлять route-правила в UFW
 EOF
+    else
+        cat <<EOF
+Usage: $PROG add <tcp|udp|both> <port|range> <ip[:port]> [name] [options]
+
+  <port>     port on this server; range: 20000-20100
+  <ip:port>  target server; if the port is omitted, it is the same as the incoming one
+             (for ranges, ports are always preserved)
+  [name]     a-z, 0-9, _ and -; default: proto-port
+
+Options:
+  --name N    same as [name]
+  --force     create the rule despite warnings (SSH, busy ports)
+  --dry-run   show the ruleset and validate it with nft -c without applying anything
+  --no-ufw    do not add route rules to UFW
+EOF
+    fi
 }
 
 cmd_add() {
@@ -407,13 +518,13 @@ cmd_add() {
     while (( $# )); do
         case $1 in
             -n|--name)
-                [[ $# -ge 2 ]] || { err "--name требует значение"; return 1; }
+                [[ $# -ge 2 ]] || { err "--name требует значение" "--name requires a value"; return 1; }
                 name=$2; shift 2 ;;
             --force)   force=1; shift ;;
             --dry-run) dry=1; shift ;;
             --no-ufw)  noufw=1; shift ;;
             -h|--help) usage_add; return 0 ;;
-            -*)        err "Неизвестная опция: $1"; return 1 ;;
+            -*)        err "Неизвестная опция: $1" "Unknown option: $1"; return 1 ;;
             *)         pos+=("$1"); shift ;;
         esac
     done
@@ -431,22 +542,27 @@ add_rule() {
     need_root || return 1
     need_nft || return 1
 
-    valid_proto "$proto" || { err "Протокол должен быть tcp, udp или both"; return 1; }
-    is_portspec "$inspec" || { err "Некорректный входящий порт: $inspec"; return 1; }
+    valid_proto "$proto" || { err "Протокол должен быть tcp, udp или both" "Protocol must be tcp, udp or both"; return 1; }
+    is_portspec "$inspec" || { err "Некорректный входящий порт: $inspec" "Invalid incoming port: $inspec"; return 1; }
     if [[ $to == *:* ]]; then
         ip=${to%%:*}; outspec=${to#*:}
     else
         ip=$to; outspec=$inspec
     fi
-    is_ipv4 "$ip" || { err "Некорректный IPv4-адрес: $ip"; return 1; }
-    is_portspec "$outspec" || { err "Некорректный порт назначения: $outspec"; return 1; }
+    is_ipv4 "$ip" || { err "Некорректный IPv4-адрес: $ip" "Invalid IPv4 address: $ip"; return 1; }
+    is_portspec "$outspec" || { err "Некорректный порт назначения: $outspec" "Invalid target port: $outspec"; return 1; }
     if [[ ( $inspec == *-* || $outspec == *-* ) && $inspec != "$outspec" ]]; then
-        err "Диапазоны пробрасываются только с сохранением портов (вход и выход должны совпадать)."
+        err "Диапазоны пробрасываются только с сохранением портов (вход и выход должны совпадать)." \
+            "Port ranges are forwarded with ports preserved only (incoming and target ports must match)."
         return 1
     fi
     validate_target_ip "$ip" || return 1
     [[ -z $name ]] && name="${proto}-${inspec}"
-    valid_name "$name" || { err "Недопустимое имя «$name»: разрешены a-z, 0-9, _ и - (до 32 символов)"; return 1; }
+    valid_name "$name" || {
+        err "Недопустимое имя «$name»: разрешены a-z, 0-9, _ и - (до 32 символов)" \
+            "Invalid name '$name': only a-z, 0-9, _ and - are allowed (up to 32 characters)"
+        return 1
+    }
 
     with_lock _add_locked "$proto" "$inspec" "$ip" "$outspec" "$name" "$force" "$dry" "$noufw"
 }
@@ -458,11 +574,13 @@ _add_locked() {
 
     for ((i = 0; i < ${#R_NAME[@]}; i++)); do
         if [[ ${R_NAME[i]} == "$name" ]]; then
-            err "Правило с именем «$name» уже есть. Выберите другое имя или удалите старое: $PROG del $name"
+            err "Правило с именем «$name» уже есть. Выберите другое имя или удалите старое: $PROG del $name" \
+                "A rule named '$name' already exists. Pick another name or delete the old one: $PROG del $name"
             return 1
         fi
         if protos_overlap "$proto" "${R_PROTO[i]}" && ranges_overlap "$inspec" "${R_IN[i]}"; then
-            err "Порт ${R_PROTO[i]}/${R_IN[i]} уже занят правилом «${R_NAME[i]}»."
+            err "Порт ${R_PROTO[i]}/${R_IN[i]} уже занят правилом «${R_NAME[i]}»." \
+                "Port ${R_PROTO[i]}/${R_IN[i]} is already used by rule '${R_NAME[i]}'."
             return 1
         fi
     done
@@ -471,11 +589,12 @@ _add_locked() {
     rc=$?
     if (( rc != 0 )); then
         if (( force )); then
-            warn "Продолжаю из-за --force."
-        elif (( INTERACTIVE )) && confirm "Всё равно создать правило?"; then
+            warn "Продолжаю из-за --force." "Continuing because of --force."
+        elif (( INTERACTIVE )) && confirm "Всё равно создать правило?" "Create the rule anyway?"; then
             :
         else
-            err "Отменено. Исправьте причину или добавьте --force (на свой риск)."
+            err "Отменено. Исправьте причину или добавьте --force (на свой риск)." \
+                "Cancelled. Fix the cause or add --force (at your own risk)."
             return 1
         fi
     fi
@@ -486,7 +605,7 @@ _add_locked() {
     if (( dry )); then
         gen_nft
         if gen_nft | nft -c -f - 2>&1; then
-            ok "Конфигурация корректна (dry-run, ничего не применено)."
+            ok "Конфигурация корректна (dry-run, ничего не применено)." "Configuration is valid (dry-run, nothing applied)."
             return 0
         fi
         return 1
@@ -496,8 +615,10 @@ _add_locked() {
     (( noufw )) || ufw_add_rule "$n"
 
     sip=$(server_ip)
-    ok "Правило «$name» создано: $proto $inspec -> $ip:$outspec"
-    echo "   Клиентам указывайте адрес ${C_GRN}${sip}${C_OFF} и порт ${C_GRN}${inspec}${C_OFF} вместо зарубежного сервера."
+    ok "Правило «$name» создано: $proto $inspec -> $ip:$outspec" "Rule '$name' created: $proto $inspec -> $ip:$outspec"
+    sel "   Клиентам указывайте адрес ${C_GRN}${sip}${C_OFF} и порт ${C_GRN}${inspec}${C_OFF} вместо зарубежного сервера." \
+        "   In your client, use address ${C_GRN}${sip}${C_OFF} and port ${C_GRN}${inspec}${C_OFF} instead of the target server's."
+    printf '%s\n' "$S"
 }
 
 # ------------------------------------------------------------ list/del -----
@@ -505,10 +626,11 @@ cmd_list() {
     load_rules || return 1
     local n=${#R_NAME[@]} i
     if (( n == 0 )); then
-        info "Правил нет. Добавьте: $PROG add udp 51820 203.0.113.10"
+        info "Правил нет. Добавьте: $PROG add udp 51820 203.0.113.10" "No rules yet. Add one: $PROG add udp 51820 203.0.113.10"
         return 0
     fi
-    echo "Адрес этого сервера: ${C_GRN}$(server_ip)${C_OFF}"
+    sel "Адрес этого сервера:" "This server's address:"
+    echo "$S ${C_GRN}$(server_ip)${C_OFF}"
     echo
     printf '%-3s %-20s %-6s %-13s %s\n' "#" "NAME" "PROTO" "IN" "TARGET"
     for ((i = 0; i < n; i++)); do
@@ -518,7 +640,7 @@ cmd_list() {
 }
 
 cmd_del() {
-    [[ $# -eq 1 ]] || { err "Использование: $PROG del <имя|номер>"; return 1; }
+    [[ $# -eq 1 ]] || { err "Использование: $PROG del <имя|номер>" "Usage: $PROG del <name|number>"; return 1; }
     need_root || return 1
     need_nft || return 1
     with_lock _del_locked "$1"
@@ -536,15 +658,16 @@ _del_locked() {
         done
     fi
     if (( idx < 0 )); then
-        err "Правило не найдено: $key"
+        err "Правило не найдено: $key" "Rule not found: $key"
         return 1
     fi
     name=${R_NAME[idx]}
     remove_rule_at "$idx"
     commit || return 1
     ufw_purge "$name"
-    ok "Правило «$name» удалено."
-    info "Уже установленные соединения живут до своего завершения (conntrack)."
+    ok "Правило «$name» удалено." "Rule '$name' deleted."
+    info "Уже установленные соединения живут до своего завершения (conntrack)." \
+         "Established connections keep working until they end (conntrack)."
 }
 
 # ------------------------------------------------------------- stats -------
@@ -552,7 +675,7 @@ cmd_stats() {
     need_root || return 1
     need_nft || return 1
     if ! nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
-        err "Таблица $NFT_TABLE не загружена. Выполните: $PROG apply"
+        err "Таблица $NFT_TABLE не загружена. Выполните: $PROG apply" "Table $NFT_TABLE is not loaded. Run: $PROG apply"
         return 1
     fi
     printf '%-20s %-6s %-13s %-10s %s\n' "NAME" "PROTO" "IN" "PACKETS" "TRAFFIC"
@@ -567,14 +690,15 @@ cmd_stats() {
         printf '%-20s %-6s %-13s %-10s %s\n' "$name" "$proto" "$inport" "${pk:-0}" "$traffic"
     done
     echo
-    info "Считается трафик клиент → цель; счётчики обнуляются при каждом изменении правил."
+    info "Считается трафик клиент → цель; счётчики обнуляются при каждом изменении правил." \
+         "Counts client → target traffic; counters reset whenever the rules change."
 }
 
 # ------------------------------------------------------------- check -------
 cmd_check() {
     local only=${1:-} i found=0 ip port p bad=0
     load_rules || return 1
-    if (( ${#R_NAME[@]} == 0 )); then info "Правил нет."; return 0; fi
+    if (( ${#R_NAME[@]} == 0 )); then info "Правил нет." "No rules."; return 0; fi
     for ((i = 0; i < ${#R_NAME[@]}; i++)); do
         [[ -n $only && ${R_NAME[i]} != "$only" ]] && continue
         found=1
@@ -582,96 +706,125 @@ cmd_check() {
         port=$(port_lo "${R_OUT[i]}")
         echo "${C_BLD}${R_NAME[i]}${C_OFF}  (${R_PROTO[i]} ${R_IN[i]} -> $ip:${R_OUT[i]})"
         if ping -c1 -W2 "$ip" >/dev/null 2>&1; then
-            ok "ping $ip отвечает"
+            ok "ping $ip отвечает" "ping $ip replies"
         else
-            warn "ping $ip не проходит (ICMP может быть закрыт — это не всегда ошибка)"
+            warn "ping $ip не проходит (ICMP может быть закрыт — это не всегда ошибка)" \
+                 "ping $ip fails (ICMP may be blocked — not necessarily a problem)"
         fi
         for p in $(protos_of "${R_PROTO[i]}"); do
             if [[ $p == tcp ]]; then
                 if timeout 3 bash -c 'exec 3<>"/dev/tcp/$0/$1"' "$ip" "$port" 2>/dev/null; then
-                    ok "TCP $ip:$port — порт открыт"
+                    ok "TCP $ip:$port — порт открыт" "TCP $ip:$port — port is open"
                 else
-                    err "TCP $ip:$port недоступен"
+                    err "TCP $ip:$port недоступен" "TCP $ip:$port is unreachable"
                     bad=1
                 fi
             else
-                info "UDP $ip:$port: без ответа службы надёжно не проверить — проверьте подключением клиента"
+                info "UDP $ip:$port: без ответа службы надёжно не проверить — проверьте подключением клиента" \
+                     "UDP $ip:$port: cannot be verified reliably without a service reply — test with a real client connection"
             fi
         done
     done
-    if (( ! found )); then err "Правило не найдено: $only"; return 1; fi
+    if (( ! found )); then err "Правило не найдено: $only" "Rule not found: $only"; return 1; fi
     return $bad
 }
 
 # ------------------------------------------------------------ doctor -------
-d_ok()   { printf '  %s %s\n' "${C_GRN}✔${C_OFF}" "$*"; }
-d_warn() { printf '  %s %s\n' "${C_YEL}!${C_OFF}" "$*"; }
-d_bad()  { printf '  %s %s\n' "${C_RED}✘${C_OFF}" "$*"; DOCTOR_BAD=1; }
+d_ok()   { sel "$@"; printf '  %s %s\n' "${C_GRN}✔${C_OFF}" "$S"; }
+d_warn() { sel "$@"; printf '  %s %s\n' "${C_YEL}!${C_OFF}" "$S"; }
+d_bad()  { sel "$@"; printf '  %s %s\n' "${C_RED}✘${C_OFF}" "$S"; DOCTOR_BAD=1; }
 
 cmd_doctor() {
     need_root || return 1
     DOCTOR_BAD=0
     local i fwd cc pol
 
-    echo "${C_BLD}Диагностика $PROG $VERSION${C_OFF}"
+    say "${C_BLD}Диагностика $PROG $VERSION${C_OFF}" "${C_BLD}$PROG $VERSION diagnostics${C_OFF}"
 
-    if have nft; then d_ok "nftables: $(nft --version 2>/dev/null)"; else d_bad "nftables не установлен ($PROG install)"; fi
+    if have nft; then
+        d_ok "nftables: $(nft --version 2>/dev/null)"
+    else
+        d_bad "nftables не установлен ($PROG install)" "nftables is not installed ($PROG install)"
+    fi
 
-    if load_rules; then d_ok "Конфигурация $RULES_FILE читается, правил: ${#R_NAME[@]}"; else d_bad "Конфигурация повреждена"; fi
+    if load_rules; then
+        d_ok "Конфигурация $RULES_FILE читается, правил: ${#R_NAME[@]}" "Config $RULES_FILE is readable, rules: ${#R_NAME[@]}"
+    else
+        d_bad "Конфигурация повреждена" "Config is corrupted"
+    fi
 
     if have nft; then
         if nft list table ip "$NFT_TABLE" >/dev/null 2>&1; then
-            d_ok "Таблица nft «$NFT_TABLE» загружена"
+            d_ok "Таблица nft «$NFT_TABLE» загружена" "nft table '$NFT_TABLE' is loaded"
         elif (( ${#R_NAME[@]} > 0 )); then
-            d_bad "Таблица nft «$NFT_TABLE» не загружена, хотя правила есть — выполните: $PROG apply"
+            d_bad "Таблица nft «$NFT_TABLE» не загружена, хотя правила есть — выполните: $PROG apply" \
+                  "nft table '$NFT_TABLE' is not loaded although rules exist — run: $PROG apply"
         else
-            d_warn "Таблица nft «$NFT_TABLE» не загружена (правил нет)"
+            d_warn "Таблица nft «$NFT_TABLE» не загружена (правил нет)" "nft table '$NFT_TABLE' is not loaded (no rules)"
         fi
     fi
 
     fwd=$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)
-    if [[ $fwd == 1 ]]; then d_ok "net.ipv4.ip_forward = 1"; else d_bad "net.ipv4.ip_forward = ${fwd:-?} — пересылка выключена ($PROG install)"; fi
-    if [[ -f $SYSCTL_FWD ]]; then d_ok "Пересылка сохранена в $SYSCTL_FWD"; else d_warn "Нет $SYSCTL_FWD: после перезагрузки пересылка может выключиться"; fi
+    if [[ $fwd == 1 ]]; then
+        d_ok "net.ipv4.ip_forward = 1"
+    else
+        d_bad "net.ipv4.ip_forward = ${fwd:-?} — пересылка выключена ($PROG install)" \
+              "net.ipv4.ip_forward = ${fwd:-?} — forwarding is disabled ($PROG install)"
+    fi
+    if [[ -f $SYSCTL_FWD ]]; then
+        d_ok "Пересылка сохранена в $SYSCTL_FWD" "Forwarding is persisted in $SYSCTL_FWD"
+    else
+        d_warn "Нет $SYSCTL_FWD: после перезагрузки пересылка может выключиться" \
+               "$SYSCTL_FWD is missing: forwarding may be disabled after a reboot"
+    fi
 
     if have systemctl && [[ -d /run/systemd/system ]]; then
         if systemctl is-enabled "$UNIT_NAME" >/dev/null 2>&1; then
-            d_ok "Автозагрузка $UNIT_NAME включена"
+            d_ok "Автозагрузка $UNIT_NAME включена" "Autostart of $UNIT_NAME is enabled"
         else
-            d_bad "Автозагрузка $UNIT_NAME не включена ($PROG install)"
+            d_bad "Автозагрузка $UNIT_NAME не включена ($PROG install)" "Autostart of $UNIT_NAME is not enabled ($PROG install)"
         fi
     else
-        d_warn "systemd не найден: добавьте «$PROG apply» в автозагрузку вручную"
+        d_warn "systemd не найден: добавьте «$PROG apply» в автозагрузку вручную" \
+               "systemd not found: add '$PROG apply' to your boot scripts manually"
     fi
 
     if ufw_active; then
-        d_ok "UFW активен"
+        d_ok "UFW активен" "UFW is active"
         for ((i = 0; i < ${#R_NAME[@]}; i++)); do
             if ufwc show added 2>/dev/null | grep -qF "comment '${TAG_PREFIX}${R_NAME[i]}'"; then
-                d_ok "UFW: есть route-правило для «${R_NAME[i]}»"
+                d_ok "UFW: есть route-правило для «${R_NAME[i]}»" "UFW: route rule for '${R_NAME[i]}' exists"
             else
-                d_bad "UFW: нет route-правила для «${R_NAME[i]}» — трафик будет блокироваться. Выполните: $PROG apply"
+                d_bad "UFW: нет route-правила для «${R_NAME[i]}» — трафик будет блокироваться. Выполните: $PROG apply" \
+                      "UFW: no route rule for '${R_NAME[i]}' — traffic will be blocked. Run: $PROG apply"
             fi
         done
     elif have iptables; then
         pol=$(iptables -S FORWARD 2>/dev/null | head -n1)
         if [[ $pol == "-P FORWARD DROP" ]]; then
-            d_warn "iptables: политика FORWARD = DROP (Docker?). Проброс не пройдёт, пока вы не разрешите форвардинг к целям в своём файрволе."
+            d_warn "iptables: политика FORWARD = DROP (Docker?). Проброс не пройдёт, пока вы не разрешите форвардинг к целям в своём файрволе." \
+                   "iptables: FORWARD policy is DROP (Docker?). Forwarding will not work until you allow it to the targets in your own firewall."
         else
-            d_ok "iptables FORWARD не блокирует проброс"
+            d_ok "iptables FORWARD не блокирует проброс" "iptables FORWARD does not block forwarding"
         fi
     fi
 
     if [[ -f /etc/nftables.conf ]] && grep -q 'flush ruleset' /etc/nftables.conf \
         && systemctl is-enabled nftables.service >/dev/null 2>&1; then
-        d_warn "nftables.service делает «flush ruleset»: его reload сотрёт и таблицу $NFT_TABLE. Восстановление: $PROG apply (при restart сервиса xcascade перезапускается сам)"
+        d_warn "nftables.service делает «flush ruleset»: его reload сотрёт и таблицу $NFT_TABLE. Восстановление: $PROG apply (при restart сервиса $PROG перезапускается сам)" \
+               "nftables.service does 'flush ruleset': its reload also wipes the $NFT_TABLE table. Restore it with: $PROG apply (a restart of the service restarts $PROG automatically)"
     fi
 
     cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    d_ok "TCP congestion control: ${cc:-?} (BBR на роутере почти не влияет на проброс, см. README)"
+    d_ok "TCP congestion control: ${cc:-?} (BBR на роутере почти не влияет на проброс, см. README)" \
+         "TCP congestion control: ${cc:-?} (BBR on the relay hardly affects forwarded traffic, see README)"
 
     echo
-    if (( DOCTOR_BAD )); then err "Есть проблемы — см. пункты ✘ выше."; return 1; fi
-    ok "Проблем не найдено."
+    if (( DOCTOR_BAD )); then
+        err "Есть проблемы — см. пункты ✘ выше." "Problems found — see the ✘ items above."
+        return 1
+    fi
+    ok "Проблем не найдено." "No problems found."
 }
 
 # ------------------------------------------------------------- apply -------
@@ -687,16 +840,18 @@ _apply_locked() {
     apply_nft || return 1
     ufw_purge
     ufw_add_all
-    ok "Правила применены (${#R_NAME[@]} шт.)."
+    ok "Правила применены (${#R_NAME[@]} шт.)." "Rules applied (${#R_NAME[@]})."
 }
 
 # ------------------------------------------------------ backup/restore -----
 cmd_backup() {
     need_root || return 1
-    if [[ ! -s $RULES_FILE ]]; then info "Нечего сохранять: правил нет."; return 0; fi
+    if [[ ! -s $RULES_FILE ]]; then info "Нечего сохранять: правил нет." "Nothing to back up: no rules."; return 0; fi
     ensure_dirs || return 1
     make_backup
-    ok "Бэкап сохранён в $BACKUP_DIR (последний: $(ls -1t "$BACKUP_DIR"/rules-*.conf 2>/dev/null | head -n1))"
+    local last
+    last=$(ls -1t "$BACKUP_DIR"/rules-*.conf 2>/dev/null | head -n1)
+    ok "Бэкап сохранён в $BACKUP_DIR (последний: $last)" "Backup saved to $BACKUP_DIR (latest: $last)"
 }
 
 cmd_restore() {
@@ -706,25 +861,28 @@ cmd_restore() {
     if [[ -z $f ]]; then
         local -a bk=()
         mapfile -t bk < <(ls -1t "$BACKUP_DIR"/rules-*.conf 2>/dev/null)
-        if (( ${#bk[@]} == 0 )); then info "Бэкапов нет."; return 0; fi
-        echo "Доступные бэкапы:"
+        if (( ${#bk[@]} == 0 )); then info "Бэкапов нет." "No backups."; return 0; fi
+        say "Доступные бэкапы:" "Available backups:"
         printf '  %s\n' "${bk[@]}"
-        echo "Восстановить: $PROG restore <файл>"
+        say "Восстановить: $PROG restore <файл>" "Restore with: $PROG restore <file>"
         return 0
     fi
     [[ -f $f ]] || f="$BACKUP_DIR/$f"
-    [[ -f $f ]] || { err "Файл не найден: $1"; return 1; }
+    [[ -f $f ]] || { err "Файл не найден: $1" "File not found: $1"; return 1; }
     with_lock _restore_locked "$f"
 }
 
 _restore_locked() {
     local f=$1
     ensure_dirs || return 1
-    load_rules "$f" || { err "Файл бэкапа повреждён, ничего не изменено."; return 1; }
+    load_rules "$f" || {
+        err "Файл бэкапа повреждён, ничего не изменено." "The backup file is corrupted, nothing was changed."
+        return 1
+    }
     ufw_purge
     commit || return 1
     ufw_add_all
-    ok "Восстановлено из $f (правил: ${#R_NAME[@]})."
+    ok "Восстановлено из $f (правил: ${#R_NAME[@]})." "Restored from $f (rules: ${#R_NAME[@]})."
 }
 
 # --------------------------------------------------------------- bbr -------
@@ -732,19 +890,21 @@ cmd_bbr() {
     need_root || return 1
     local cur
     cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-    if [[ $cur == bbr ]]; then ok "BBR уже включён."; return 0; fi
+    if [[ $cur == bbr ]]; then ok "BBR уже включён." "BBR is already enabled."; return 0; fi
     modprobe tcp_bbr 2>/dev/null
     if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | tr ' ' '\n' | grep -qx bbr; then
-        err "Ядро не поддерживает BBR (нужно Linux >= 4.9 с модулем tcp_bbr)."
+        err "Ядро не поддерживает BBR (нужно Linux >= 4.9 с модулем tcp_bbr)." \
+            "The kernel does not support BBR (Linux >= 4.9 with the tcp_bbr module is required)."
         return 1
     fi
     printf 'net.core.default_qdisc = fq\nnet.ipv4.tcp_congestion_control = bbr\n' > "$SYSCTL_BBR"
     echo tcp_bbr > "$MODULES_BBR" 2>/dev/null
     if sysctl -q -p "$SYSCTL_BBR" >/dev/null 2>&1; then
-        ok "BBR включён и сохранён в $SYSCTL_BBR."
-        info "Важно: BBR ускоряет только TCP-сессии самого сервера. Проброшенный трафик идёт сквозь сервер между клиентом и целью и от BBR здесь не ускоряется."
+        ok "BBR включён и сохранён в $SYSCTL_BBR." "BBR enabled and saved to $SYSCTL_BBR."
+        info "Важно: BBR ускоряет только TCP-сессии самого сервера. Проброшенный трафик идёт сквозь сервер между клиентом и целью и от BBR здесь не ускоряется." \
+             "Note: BBR only speeds up TCP sessions of the server itself. Forwarded traffic passes through the server between the client and the target and does not get faster from BBR here."
     else
-        err "Не удалось применить sysctl из $SYSCTL_BBR"
+        err "Не удалось применить sysctl из $SYSCTL_BBR" "Could not apply sysctl from $SYSCTL_BBR"
         return 1
     fi
 }
@@ -753,13 +913,14 @@ cmd_bbr() {
 install_deps() {
     have nft && return 0
     if ! have apt-get; then
-        err "nftables не найден, а apt-get недоступен. Установите nftables вручную и повторите."
+        err "nftables не найден, а apt-get недоступен. Установите nftables вручную и повторите." \
+            "nftables not found and apt-get is unavailable. Install nftables manually and retry."
         return 1
     fi
-    info "Устанавливаю nftables..."
+    info "Устанавливаю nftables..." "Installing nftables..."
     if ! { DEBIAN_FRONTEND=noninteractive apt-get update -qq \
         && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nftables >/dev/null; }; then
-        err "Не удалось установить nftables."
+        err "Не удалось установить nftables." "Failed to install nftables."
         return 1
     fi
 }
@@ -769,7 +930,7 @@ write_unit() {
     nftbin=$(command -v nft)
     cat > "$UNIT_PATH" <<EOF
 [Unit]
-Description=XCascade: правила проброса портов (nftables)
+Description=xcascade: port forwarding rules (nftables)
 After=network-pre.target nftables.service ufw.service
 Wants=network-pre.target
 PartOf=nftables.service
@@ -790,33 +951,46 @@ EOF
 }
 
 cmd_install() {
-    local want_bbr=0 self
+    local want_bbr=0 self lang_opt=""
     while (( $# )); do
         case $1 in
             --bbr) want_bbr=1 ;;
-            *) err "Неизвестная опция: $1"; return 1 ;;
+            --lang)
+                if [[ ${2:-} != ru && ${2:-} != en ]]; then
+                    err "--lang принимает ru или en" "--lang accepts ru or en"
+                    return 1
+                fi
+                lang_opt=$2; shift ;;
+            *) err "Неизвестная опция: $1" "Unknown option: $1"; return 1 ;;
         esac
         shift
     done
     need_root || return 1
 
     if ! (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
-        err "Нужен bash >= 4.4"
+        err "Нужен bash >= 4.4" "bash >= 4.4 is required"
         return 1
     fi
     install_deps || return 1
     ensure_dirs || return 1
+    [[ -n $lang_opt ]] && set_lang "$lang_opt"
 
     self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null)
     if [[ -f $self && $self != "$BIN_PATH" ]]; then
-        install -m 755 "$self" "$BIN_PATH" || { err "Не удалось скопировать скрипт в $BIN_PATH"; return 1; }
+        install -m 755 "$self" "$BIN_PATH" || {
+            err "Не удалось скопировать скрипт в $BIN_PATH" "Could not copy the script to $BIN_PATH"
+            return 1
+        }
     elif [[ ! -f $BIN_PATH ]]; then
-        err "Скачайте скрипт в файл и запустите из него (запуск через pipe не поддерживается)."
+        err "Скачайте скрипт в файл и запустите из него (запуск через pipe не поддерживается)." \
+            "Download the script to a file and run it from there (running through a pipe is not supported)."
         return 1
     fi
 
     printf 'net.ipv4.ip_forward = 1\n' > "$SYSCTL_FWD"
-    sysctl -q -p "$SYSCTL_FWD" >/dev/null 2>&1 || warn "Не удалось включить ip_forward сейчас — проверьте: $PROG doctor"
+    sysctl -q -p "$SYSCTL_FWD" >/dev/null 2>&1 || \
+        warn "Не удалось включить ip_forward сейчас — проверьте: $PROG doctor" \
+             "Could not enable ip_forward right now — check: $PROG doctor"
 
     with_lock _install_rules || return 1
 
@@ -824,11 +998,13 @@ cmd_install() {
         write_unit
         systemctl start "$UNIT_NAME" >/dev/null 2>&1
     else
-        warn "systemd не найден: автозагрузку правил настройте вручную (команда: $PROG apply)."
+        warn "systemd не найден: автозагрузку правил настройте вручную (команда: $PROG apply)." \
+             "systemd not found: set up autostart of the rules manually (command: $PROG apply)."
     fi
 
     (( want_bbr )) && cmd_bbr
-    ok "Установлено. Команда: $PROG  (меню) или $PROG help"
+    # Итоговое сообщение установки — всегда на английском.
+    ok "Installed. Run: $PROG (menu) or $PROG help. Change the language: $PROG lang"
 }
 
 _install_rules() {
@@ -842,24 +1018,31 @@ cmd_uninstall() {
         case $1 in
             --purge) purge=1 ;;
             --yes)   yes=1 ;;
-            *) err "Неизвестная опция: $1"; return 1 ;;
+            *) err "Неизвестная опция: $1" "Unknown option: $1"; return 1 ;;
         esac
         shift
     done
     need_root || return 1
 
-    echo "Будет удалено: таблица nft «$NFT_TABLE», route-правила xcascade в UFW, systemd-юнит,"
-    echo "$SYSCTL_FWD, $SYSCTL_BBR, команда $BIN_PATH. Чужие правила файрвола НЕ затрагиваются."
-    (( purge )) && echo "Также будет удалён каталог $CONF_DIR (правила и бэкапы)." \
-                || echo "Каталог $CONF_DIR (правила и бэкапы) останется."
+    say "Будет удалено: таблица nft «$NFT_TABLE», route-правила $PROG в UFW, systemd-юнит," \
+        "Will be removed: nft table '$NFT_TABLE', $PROG route rules in UFW, the systemd unit,"
+    say "$SYSCTL_FWD, $SYSCTL_BBR, команда $BIN_PATH. Чужие правила файрвола НЕ затрагиваются." \
+        "$SYSCTL_FWD, $SYSCTL_BBR and the $BIN_PATH command. Other firewall rules are NOT touched."
+    if (( purge )); then
+        say "Также будет удалён каталог $CONF_DIR (правила, бэкапы, язык)." \
+            "The $CONF_DIR directory (rules, backups, language) will be removed as well."
+    else
+        say "Каталог $CONF_DIR (правила и бэкапы) останется." "The $CONF_DIR directory (rules and backups) will be kept."
+    fi
     if (( ! yes )); then
-        confirm "Продолжить?" || { info "Отменено."; return 0; }
+        confirm "Продолжить?" "Continue?" || { info "Отменено." "Cancelled."; return 0; }
     fi
 
     with_lock _uninstall_locked
     (( purge )) && rm -rf "$CONF_DIR"
     rm -f "$BIN_PATH"
-    ok "xcascade удалён. net.ipv4.ip_forward в работающей системе не менялся."
+    ok "$PROG удалён. net.ipv4.ip_forward в работающей системе не менялся." \
+       "$PROG removed. The running net.ipv4.ip_forward value was not changed."
 }
 
 _uninstall_locked() {
@@ -875,15 +1058,17 @@ _uninstall_locked() {
 }
 
 # -------------------------------------------------------------- меню -------
-# ask VAR "вопрос" валидатор [по умолчанию]; пустой ввод без умолчания = отмена
+# ask VAR валидатор "ru" "en" [по умолчанию]; пустой ввод без умолчания = отмена
 ask() {
-    local __var=$1 prompt=$2 validator=$3 def=${4:-} ans
+    local __var=$1 validator=$2 def=${5:-} ans prompt hint
+    sel "$3" "$4"; prompt=$S
+    sel " (пусто — отмена)" " (empty to cancel)"; hint=$S
     while true; do
         if [[ -n $def ]]; then
             read -r -p "$prompt [$def]: " ans || return 1
             ans=${ans:-$def}
         else
-            read -r -p "$prompt (пусто — отмена): " ans || return 1
+            read -r -p "$prompt$hint: " ans || return 1
         fi
         ans=${ans//[[:space:]]/}
         [[ -n $ans ]] || return 1
@@ -891,35 +1076,44 @@ ask() {
             printf -v "$__var" '%s' "$ans"
             return 0
         fi
-        err "Некорректное значение, попробуйте ещё раз."
+        err "Некорректное значение, попробуйте ещё раз." "Invalid value, please try again."
     done
 }
+
+menu_item() { sel "$2" "$3"; printf ' %s) %s\n' "$1" "$S"; }
 
 menu_add() {
     local choice proto="" label ip inport outport name
     echo
-    echo " 1) AmneziaWG / WireGuard  (UDP)"
-    echo " 2) VLESS / XRay           (TCP)"
-    echo " 3) MTProto / TProxy       (TCP)"
-    echo " 4) Другое (tcp / udp / оба, порт или диапазон)"
-    read -r -p "Что пробрасываем: " choice || return 0
+    menu_item 1 "AmneziaWG / WireGuard  (UDP)" "AmneziaWG / WireGuard  (UDP)"
+    menu_item 2 "VLESS / XRay           (TCP)" "VLESS / XRay           (TCP)"
+    menu_item 3 "MTProto / TProxy       (TCP)" "MTProto / TProxy       (TCP)"
+    menu_item 4 "Другое (tcp / udp / оба, порт или диапазон)" "Other (tcp / udp / both, port or range)"
+    sel "Что пробрасываем: " "What to forward: "
+    read -r -p "$S" choice || return 0
     case $choice in
         1) proto=udp;  label=awg ;;
         2) proto=tcp;  label=vless ;;
         3) proto=tcp;  label=mtproto ;;
-        4) ask proto "Протокол tcp / udp / both" valid_proto || { info "Отменено."; return 0; }
+        4) ask proto valid_proto "Протокол tcp / udp / both" "Protocol tcp / udp / both" \
+               || { info "Отменено." "Cancelled."; return 0; }
            label=$proto ;;
         *) return 0 ;;
     esac
-    ask ip "IP целевого (зарубежного) сервера" is_ipv4 || { info "Отменено."; return 0; }
-    ask inport "Порт на ЭТОМ сервере (можно диапазон, напр. 20000-20100)" is_portspec || { info "Отменено."; return 0; }
+    ask ip is_ipv4 "IP целевого (зарубежного) сервера" "Target (foreign) server IP" \
+        || { info "Отменено." "Cancelled."; return 0; }
+    ask inport is_portspec "Порт на ЭТОМ сервере (можно диапазон, напр. 20000-20100)" \
+        "Port on THIS server (a range like 20000-20100 is allowed)" \
+        || { info "Отменено." "Cancelled."; return 0; }
     if [[ $inport == *-* ]]; then
         outport=$inport
-        info "Для диапазона порт назначения совпадает с входящим."
+        info "Для диапазона порт назначения совпадает с входящим." "For a range, the target port equals the incoming port."
     else
-        ask outport "Порт на целевом сервере" is_portspec "$inport" || { info "Отменено."; return 0; }
+        ask outport is_portspec "Порт на целевом сервере" "Port on the target server" "$inport" \
+            || { info "Отменено." "Cancelled."; return 0; }
     fi
-    ask name "Имя правила" valid_name "${label}-${inport}" || { info "Отменено."; return 0; }
+    ask name valid_name "Имя правила" "Rule name" "${label}-${inport}" \
+        || { info "Отменено." "Cancelled."; return 0; }
     add_rule "$proto" "$inport" "$ip:$outport" "$name" 0 0 0
 }
 
@@ -927,35 +1121,41 @@ menu_del() {
     local key
     cmd_list || return 0
     echo
-    read -r -p "Номер или имя правила для удаления (пусто — отмена): " key || return 0
+    sel "Номер или имя правила для удаления (пусто — отмена): " "Rule number or name to delete (empty to cancel): "
+    read -r -p "$S" key || return 0
     [[ -n $key ]] || return 0
     cmd_del "$key"
 }
 
 menu_backup() {
     local c f
-    echo " 1) Создать бэкап"
-    echo " 2) Восстановить из бэкапа"
-    read -r -p "Выбор: " c || return 0
+    menu_item 1 "Создать бэкап" "Create a backup"
+    menu_item 2 "Восстановить из бэкапа" "Restore from a backup"
+    sel "Выбор: " "Choice: "
+    read -r -p "$S" c || return 0
     case $c in
         1) cmd_backup ;;
         2) cmd_restore
-           read -r -p "Имя файла для восстановления (пусто — отмена): " f || return 0
+           sel "Имя файла для восстановления (пусто — отмена): " "File name to restore (empty to cancel): "
+           read -r -p "$S" f || return 0
            [[ -n $f ]] && cmd_restore "$f" ;;
     esac
 }
 
 menu_bbr() {
-    echo "BBR улучшает TCP-сессии самого сервера (SSH, загрузки с VPS)."
-    echo "Проброшенный трафик идёт сквозь сервер и от BBR здесь не ускоряется."
-    confirm "Включить BBR?" && cmd_bbr
+    say "BBR улучшает TCP-сессии самого сервера (SSH, загрузки с VPS)." \
+        "BBR improves TCP sessions of the server itself (SSH, downloads on the VPS)."
+    say "Проброшенный трафик идёт сквозь сервер и от BBR здесь не ускоряется." \
+        "Forwarded traffic passes through the server and does not get faster from BBR here."
+    confirm "Включить BBR?" "Enable BBR?" && cmd_bbr
 }
 
 menu_first_run() {
     [[ -f $UNIT_PATH ]] && return 0
     have systemctl && [[ -d /run/systemd/system ]] || return 0
-    echo "Первый запуск: нужно установить зависимости и автозагрузку правил."
-    if confirm "Выполнить установку сейчас?"; then
+    say "Первый запуск: нужно установить зависимости и автозагрузку правил." \
+        "First run: dependencies and autostart of the rules need to be installed."
+    if confirm "Выполнить установку сейчас?" "Run the installation now?"; then
         cmd_install || return 1
         pause
     fi
@@ -971,17 +1171,19 @@ menu() {
         echo "${C_BLD}══════════ XCASCADE $VERSION ══════════${C_OFF}"
         echo " GitHub: ${C_CYN}${REPO_URL}${C_OFF}"
         echo "──────────────────────────────────────"
-        echo " 1) Добавить правило"
-        echo " 2) Список правил"
-        echo " 3) Удалить правило"
-        echo " 4) Статистика трафика"
-        echo " 5) Проверить доступность целей"
-        echo " 6) Диагностика (doctor)"
-        echo " 7) Бэкап / восстановление"
-        echo " 8) Включить BBR (необязательно)"
-        echo " 9) Удалить xcascade"
-        echo " 0) Выход"
-        read -r -p "Выбор: " ch || { echo; return 0; }
+        menu_item 1 "Добавить правило" "Add a rule"
+        menu_item 2 "Список правил" "List rules"
+        menu_item 3 "Удалить правило" "Delete a rule"
+        menu_item 4 "Статистика трафика" "Traffic stats"
+        menu_item 5 "Проверить доступность целей" "Check target reachability"
+        menu_item 6 "Диагностика (doctor)" "Diagnostics (doctor)"
+        menu_item 7 "Бэкап / восстановление" "Backup / restore"
+        menu_item 8 "Включить BBR (необязательно)" "Enable BBR (optional)"
+        menu_item 9 "Удалить $PROG" "Uninstall $PROG"
+        menu_item l "Language / Язык" "Language / Язык"
+        menu_item 0 "Выход" "Exit"
+        sel "Выбор: " "Choice: "
+        read -r -p "$S" ch || { echo; return 0; }
         case $ch in
             1) menu_add; pause ;;
             2) cmd_list; pause ;;
@@ -992,6 +1194,7 @@ menu() {
             7) menu_backup; pause ;;
             8) menu_bbr; pause ;;
             9) cmd_uninstall && return 0; pause ;;
+            l|L) ask_lang ;;
             0) return 0 ;;
             *) ;;
         esac
@@ -1000,7 +1203,8 @@ menu() {
 
 # -------------------------------------------------------------- main -------
 usage() {
-    cat <<EOF
+    if [[ $UI_LANG == ru ]]; then
+        cat <<EOF
 $PROG $VERSION — каскадные пробросы портов (DNAT) на nftables
 
 Использование:
@@ -1014,7 +1218,8 @@ $PROG $VERSION — каскадные пробросы портов (DNAT) на 
   $PROG apply                           пересоздать правила из конфигурации
   $PROG backup | restore [файл]         резервные копии списка правил
   $PROG bbr                             включить BBR (необязательно)
-  $PROG install [--bbr]                 установка (nftables, systemd, sysctl)
+  $PROG lang [ru|en]                    язык интерфейса
+  $PROG install [--bbr] [--lang ru|en]  установка (nftables, systemd, sysctl)
   $PROG uninstall [--purge] [--yes]     удаление (только своих правил)
   $PROG version
 
@@ -1025,15 +1230,45 @@ $PROG $VERSION — каскадные пробросы портов (DNAT) на 
 
 Репозиторий: $REPO_URL
 EOF
+    else
+        cat <<EOF
+$PROG $VERSION — port-forwarding cascades (DNAT) on nftables
+
+Usage:
+  $PROG                                 interactive menu
+  $PROG add <tcp|udp|both> <port> <ip[:port]> [name] [--force] [--dry-run] [--no-ufw]
+  $PROG list                            list rules
+  $PROG del <name|number>               delete a rule
+  $PROG stats                           packets and traffic per rule
+  $PROG check [name]                    check target reachability
+  $PROG doctor                          system diagnostics
+  $PROG apply                           recreate the rules from the config
+  $PROG backup | restore [file]         backups of the rule list
+  $PROG bbr                             enable BBR (optional)
+  $PROG lang [ru|en]                    interface language
+  $PROG install [--bbr] [--lang ru|en]  install (nftables, systemd, sysctl)
+  $PROG uninstall [--purge] [--yes]     uninstall (own objects only)
+  $PROG version
+
+Examples:
+  $PROG add udp 51820 203.0.113.10                 # WireGuard / AmneziaWG
+  $PROG add tcp 443 203.0.113.10:8443 vless        # different target port
+  $PROG add both 20000-20100 203.0.113.10          # port range, ports preserved
+
+Repository: $REPO_URL
+EOF
+    fi
 }
 
 main() {
+    load_lang
     if ! (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
-        err "Нужен bash >= 4.4"
+        err "Нужен bash >= 4.4" "bash >= 4.4 is required"
         return 1
     fi
     local cmd=${1:-}
     [[ $# -gt 0 ]] && shift
+    maybe_ask_lang "$cmd" "$@"
     case $cmd in
         "")
             if [[ -t 0 && -t 1 ]]; then menu; else usage; fi ;;
@@ -1047,11 +1282,12 @@ main() {
         backup)            cmd_backup ;;
         restore)           cmd_restore "$@" ;;
         bbr)               cmd_bbr ;;
+        lang|language)     cmd_lang "$@" ;;
         install)           cmd_install "$@" ;;
         uninstall)         cmd_uninstall "$@" ;;
         version|--version|-v) echo "$PROG $VERSION" ;;
         help|--help|-h)    usage ;;
-        *)                 err "Неизвестная команда: $cmd"; usage >&2; return 1 ;;
+        *)                 err "Неизвестная команда: $cmd" "Unknown command: $cmd"; usage >&2; return 1 ;;
     esac
 }
 
