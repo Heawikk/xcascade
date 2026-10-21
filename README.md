@@ -30,6 +30,8 @@ Download the script to a file and run it from there (piping it into `bash` is no
 sudo xcascade
 ```
 
+On the first interactive run (`install` or the menu) xcascade asks for the interface language — **English** or **Русский** — and remembers your choice. You can change it any time, see [Language](#language).
+
 What `install` does: installs nftables if missing, copies the script to `/usr/local/bin/xcascade`, enables `net.ipv4.ip_forward` (via `/etc/sysctl.d/99-xcascade.conf`), and creates and enables the `xcascade.service` systemd unit so the rules are restored on boot.
 
 ## Usage
@@ -44,6 +46,7 @@ sudo xcascade del vless                            # by name or by number from `
 sudo xcascade stats                                # packets and traffic per rule
 sudo xcascade check                                # target reachability
 sudo xcascade doctor                               # diagnostics
+sudo xcascade lang ru                              # switch the interface language (ru | en)
 ```
 
 Then, in your client app (AmneziaWG, v2rayNG, Telegram…), replace the target server's address with **the address of this VPS** and, if the ports differ, use the incoming port.
@@ -61,8 +64,20 @@ Then, in your client app (AmneziaWG, v2rayNG, Telegram…), replace the target s
 | `apply` | Recreate the rules from the config (repairs a flushed firewall) |
 | `backup`, `restore [file]` | Backups of the rule list |
 | `bbr` | Enable BBR (optional, see below) |
-| `install [--bbr]`, `uninstall [--purge] [--yes]` | Install / remove |
+| `lang [ru\|en]` | Show / change the interface language |
+| `install [--bbr] [--lang ru\|en]`, `uninstall [--purge] [--yes]` | Install / remove |
 | `help`, `version` | Help / version |
+
+## Language
+
+The interface is available in English and Russian.
+
+- On the first interactive run, `xcascade install` (or the menu) shows a language prompt. In a non-interactive run (scripts, CI) no prompt is shown and English is used.
+- Change it later with `sudo xcascade lang ru` / `sudo xcascade lang en`, or via the **Language / Язык** item in the menu (`l`). Without an argument, `xcascade lang` opens the same prompt.
+- Skip the prompt on install: `sudo bash xcascade.sh install --lang ru`.
+- Override for a single run: `XCASCADE_LANG=ru xcascade list`.
+- The choice is stored in `/etc/xcascade/lang`.
+- The final "Installed" message after `install` is always printed in English.
 
 ## How it works
 
@@ -103,10 +118,7 @@ Only xcascade's own objects are touched. The running `net.ipv4.ip_forward` value
 |---|---|
 | `/etc/xcascade/rules.conf` | Rule list: `name protocol in ip out` |
 | `/etc/xcascade/xcascade.nft` | Generated nft ruleset (used on boot) |
+| `/etc/xcascade/lang` | Interface language (`en` or `ru`) |
 | `/etc/xcascade/backups/` | Backups of the rule list |
 | `/etc/systemd/system/xcascade.service` | Autostart unit |
 | `/etc/sysctl.d/99-xcascade.conf` | Enables IP forwarding |
-
-## Links
-
-GitHub: https://github.com/Heawikk/xcascade
